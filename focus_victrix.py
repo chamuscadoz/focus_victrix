@@ -17,9 +17,10 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib.dates as mdates
 
 EMAIL_ORIGEM  = "z.cassiolato@gmail.com"
-BCC_DESTINOS   = "jvpcassiolato@gmail.com, jcassiolato@victrixcapital.com.br, gjesus@victrixcapital.com.br, ggiron@victrixcapital.com.br, rscassiolato@gmail.com"
+BCC_DESTINOS   = "jvpcassiolato@gmail.com"
 SENHA_APP     = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
 BG      = '#0E1C0E'
@@ -99,6 +100,72 @@ def busca_cambio(data_ref: str):
     except Exception as e:
         print(f"Erro Cambio ({data_ref}): {e}")
     return None
+
+
+def busca_historico_ipca(ano_ref: int) -> list:
+    """Retorna lista de (data_str, mediana) para expectativa de IPCA de `ano_ref`, últimas 52 semanas."""
+    data_inicio = (datetime.today() - timedelta(weeks=52)).strftime("%Y-%m-%d")
+    url = (
+        "https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/"
+        "ExpectativasMercadoAnuais"
+        f"?$filter=Indicador eq 'IPCA' and DataReferencia eq '{ano_ref}' and Data ge '{data_inicio}' and baseCalculo eq 0"
+        "&$select=Data,Mediana"
+        "&$format=json"
+    )
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        dados = r.json().get("value", [])
+        resultado = []
+        for d in dados:
+            try:
+                resultado.append((d["Data"], float(d["Mediana"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        resultado.sort(key=lambda x: x[0])
+        return resultado
+    except Exception as e:
+        print(f"Erro histórico IPCA {ano_ref}: {e}")
+        return []
+
+
+def gera_grafico_ipca(serie_2026: list, serie_2027: list) -> bytes:
+    fig, ax = plt.subplots(figsize=(7, 3.5), facecolor=BG)
+    ax.set_facecolor(BG)
+
+    if serie_2026:
+        datas_26 = [datetime.strptime(d, "%Y-%m-%d") for d, _ in serie_2026]
+        vals_26  = [v for _, v in serie_2026]
+        ax.plot(datas_26, vals_26, color=LIME, linewidth=2.0, label='IPCA 2026')
+
+    if serie_2027:
+        datas_27 = [datetime.strptime(d, "%Y-%m-%d") for d, _ in serie_2027]
+        vals_27  = [v for _, v in serie_2027]
+        ax.plot(datas_27, vals_27, color=SAGE, linewidth=1.5,
+                linestyle='--', label='IPCA 2027')
+
+    ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=4, interval=4))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b/%y'))
+    plt.xticks(rotation=45, ha='right', color=SAGE, fontsize=7)
+    plt.yticks(color=SAGE, fontsize=8)
+
+    ax.set_title("Evolução da Expectativa para o IPCA",
+                 color=WHITE, fontsize=10, pad=8)
+    ax.set_ylabel('%', color=SAGE, fontsize=8)
+    ax.grid(axis='y', color=MID_GRN, alpha=0.3, linewidth=0.5)
+
+    for spine in ax.spines.values():
+        spine.set_edgecolor(MID_GRN)
+
+    ax.tick_params(colors=SAGE)
+    ax.legend(facecolor=BG, edgecolor=MID_GRN, labelcolor=SAGE, fontsize=8)
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='PNG', dpi=150, bbox_inches='tight',
+                pad_inches=0.15, facecolor=BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
 def fmt(valor, decimais=2) -> str:
@@ -206,7 +273,7 @@ def gera_imagem(rows_data: list) -> bytes:
     return buf.read()
 
 
-def envia_email(imagem_bytes: bytes):
+def envia_email(imagem_bytes: bytes, grafico_bytes: bytes):
     data_str = datetime.today().strftime("%d/%m/%Y")
     msg = MIMEMultipart("related")
     msg["Subject"] = f"Victrix Capital - Mediana Focus (BCB) | {data_str}"
@@ -219,26 +286,34 @@ def envia_email(imagem_bytes: bytes):
       <p style="color:#D5DAD0;font-family:Arial,sans-serif;font-size:13px;">
         Bom dia,<br><br>
         Segue a tabela semanal <strong style="color:#88E833;">Mediana Focus (BCB)</strong>
-        de {data_str}.
+        de {data_str}, com o histórico de expectativa do IPCA para 2026 e 2027.
       </p>
       <img src="cid:tabela_focus" style="max-width:600px;border-radius:4px;"/>
+      <br><br>
+      <img src="cid:grafico_ipca" style="max-width:600px;border-radius:4px;"/>
       <p style="color:#2E6F3A;font-family:Arial,sans-serif;font-size:10px;margin-top:16px;">
         Victrix Capital
       </p>
     </body></html>
     """
     msg.attach(MIMEText(html, "html"))
+
     img_part = MIMEImage(imagem_bytes, name="focus_victrix.png")
     img_part.add_header("Content-ID", "<tabela_focus>")
     img_part.add_header("Content-Disposition", "inline", filename="focus_victrix.png")
     msg.attach(img_part)
+
+    graf_part = MIMEImage(grafico_bytes, name="grafico_ipca.png")
+    graf_part.add_header("Content-ID", "<grafico_ipca>")
+    graf_part.add_header("Content-Disposition", "inline", filename="grafico_ipca.png")
+    msg.attach(graf_part)
 
     senha = SENHA_APP.encode('ascii', errors='ignore').decode('ascii')
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(EMAIL_ORIGEM, senha)
         todos = BCC_DESTINOS.split(", ")
         smtp.sendmail(EMAIL_ORIGEM, todos, msg.as_string())
-    print(f"Email enviado para {EMAIL_DESTINO}")
+    print(f"Email enviado para {BCC_DESTINOS}")
 
 
 def main():
@@ -272,14 +347,25 @@ def main():
         {"label": "Selic (% ao ano)",   "v4": fmt(sel_4),  "v1": fmt(sel_1),  "hoje": fmt(sel_h),  "comp": seta(sel_h, sel_1)},
     ]
 
+    print("Buscando histórico IPCA 2026 e 2027...")
+    hist_2026 = busca_historico_ipca(2026)
+    hist_2027 = busca_historico_ipca(2027)
+    print(f"  IPCA 2026: {len(hist_2026)} pontos | IPCA 2027: {len(hist_2027)} pontos")
+
     print("Gerando imagem...")
     imagem = gera_imagem(rows_data)
     with open("focus_victrix_output.png", "wb") as f:
         f.write(imagem)
     print("Imagem salva: focus_victrix_output.png")
 
+    print("Gerando gráfico IPCA...")
+    grafico = gera_grafico_ipca(hist_2026, hist_2027)
+    with open("focus_victrix_grafico.png", "wb") as f:
+        f.write(grafico)
+    print("Gráfico salvo: focus_victrix_grafico.png")
+
     print("Enviando email...")
-    envia_email(imagem)
+    envia_email(imagem, grafico)
     print("Concluido.")
 
 
