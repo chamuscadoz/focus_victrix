@@ -20,7 +20,7 @@ import matplotlib.patches as patches
 import matplotlib.dates as mdates
 
 EMAIL_ORIGEM  = "z.cassiolato@gmail.com"
-BCC_DESTINOS   = "jvpcassiolato@gmail.com"
+BCC_DESTINOS   = "jvpcassiolato@gmail.com, jcassiolato@victrixcapital.com.br, gjesus@victrixcapital.com.br, ggiron@victrixcapital.com.br, rscassiolato@gmail.com, bperroni@gmail.com"
 SENHA_APP     = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
 BG      = '#0E1C0E'
