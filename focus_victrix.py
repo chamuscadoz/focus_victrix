@@ -18,9 +18,11 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.dates as mdates
+import matplotlib.font_manager as fm
+import matplotlib.image as mpimg
 
 EMAIL_ORIGEM  = "z.cassiolato@gmail.com"
-BCC_DESTINOS   = "jvpcassiolato@gmail.com, jcassiolato@victrixcapital.com.br, gjesus@victrixcapital.com.br, ggiron@victrixcapital.com.br, rscassiolato@gmail.com, bperroni@gmail.com"
+BCC_DESTINOS   = "jvpcassiolato@gmail.com, z.cassiolato@gmail.com, jcassiolato@victrixcapital.com.br, gjesus@victrixcapital.com.br, ggiron@victrixcapital.com.br, rscassiolato@gmail.com, bperroni@gmail.com, rafaferro@gmail.com"
 SENHA_APP     = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
 BG      = '#0E1C0E'
@@ -30,12 +32,37 @@ SAGE    = '#D5DAD0'
 WHITE   = '#FFFFFF'
 ALT_ROW = '#152615'
 
+_HERE     = os.path.dirname(os.path.abspath(__file__))
+_FONT_PFX = os.path.join(_HERE, 'assets', 'font', 'static', 'ZalandoSansSemiExpanded-')
+_FONT_MAP = {'reg': 'Regular', 'semi': 'SemiBold', 'bold': 'Bold',
+             'light': 'Light', 'xlight': 'ExtraLight'}
 
-def ultima_sexta(semanas_atras: int = 0) -> str:
+
+def _fp(style: str, size: float) -> fm.FontProperties:
+    p = fm.FontProperties(fname=_FONT_PFX + _FONT_MAP[style] + '.ttf')
+    p.set_size(size)
+    return p
+
+
+def ultima_publicacao(publicacoes_atras: int = 0) -> str:
+    """Busca diretamente na API as datas de publicação disponíveis.
+    Funciona independente do dia da semana — cobre feriados."""
+    url = (
+        "https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/"
+        "ExpectativasMercadoAnuais"
+        "?$filter=Indicador eq 'IPCA' and baseCalculo eq 0"
+        "&$select=Data&$format=json&$orderby=Data desc&$top=50"
+    )
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        datas = sorted(set(d["Data"] for d in r.json().get("value", [])), reverse=True)
+        if len(datas) > publicacoes_atras:
+            return datas[publicacoes_atras]
+    except Exception as e:
+        print(f"Erro ao buscar última publicação: {e}")
     hoje = datetime.today()
-    dias_ate_sexta = (hoje.weekday() - 4) % 7
-    ultima = hoje - timedelta(days=dias_ate_sexta + semanas_atras * 7)
-    return ultima.strftime("%Y-%m-%d")
+    return (hoje - timedelta(days=hoje.weekday() + publicacoes_atras * 7)).strftime("%Y-%m-%d")
 
 
 def busca_focus(indicador: str, data_ref: str):
@@ -130,35 +157,66 @@ def busca_historico_ipca(ano_ref: int) -> list:
 
 
 def gera_grafico_ipca(serie_2026: list, serie_2027: list) -> bytes:
+    blur_img = mpimg.imread(os.path.join(_HERE, 'assets', 'blur', 'blur_65.png'))
+
     fig, ax = plt.subplots(figsize=(7, 3.5), facecolor=BG)
-    ax.set_facecolor(BG)
+    ax.set_facecolor('none')
+
+    # Blur + overlay no fundo (cobre toda a figure)
+    bg = fig.add_axes([0, 0, 1, 1], zorder=0)
+    bg.imshow(blur_img, aspect='auto')
+    bg.add_patch(patches.Rectangle((0, 0), 1, 1,
+        facecolor=hex_to_rgba(BG, 0.72), edgecolor='none', transform=bg.transAxes))
+    bg.axis('off')
+
+    ax.set_zorder(1)
 
     if serie_2026:
         datas_26 = [datetime.strptime(d, "%Y-%m-%d") for d, _ in serie_2026]
         vals_26  = [v for _, v in serie_2026]
-        ax.plot(datas_26, vals_26, color=LIME, linewidth=2.0, label='IPCA 2026')
+        ax.plot(datas_26, vals_26, color=LIME, linewidth=2.8, label='IPCA 2026', zorder=3)
+        ax.plot(datas_26[-1], vals_26[-1], 'o', color=LIME, markersize=5, zorder=4)
+        ax.annotate(f"{fmt(vals_26[-1])}%",
+                    xy=(datas_26[-1], vals_26[-1]), xytext=(8, 0),
+                    textcoords='offset points', color=LIME,
+                    fontproperties=_fp('bold', 9.5), va='center', zorder=4)
 
     if serie_2027:
         datas_27 = [datetime.strptime(d, "%Y-%m-%d") for d, _ in serie_2027]
         vals_27  = [v for _, v in serie_2027]
-        ax.plot(datas_27, vals_27, color=SAGE, linewidth=1.5,
-                linestyle='--', label='IPCA 2027')
+        ax.plot(datas_27, vals_27, color=SAGE, linewidth=2.0, linestyle='--',
+                label='IPCA 2027', zorder=3)
+        ax.plot(datas_27[-1], vals_27[-1], 'o', color=SAGE, markersize=5, zorder=4)
+        ax.annotate(f"{fmt(vals_27[-1])}%",
+                    xy=(datas_27[-1], vals_27[-1]), xytext=(8, 0),
+                    textcoords='offset points', color=SAGE,
+                    fontproperties=_fp('bold', 9.5), va='center', zorder=4)
 
     ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=4, interval=4))
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%b/%y'))
-    plt.xticks(rotation=45, ha='right', color=SAGE, fontsize=7)
-    plt.yticks(color=SAGE, fontsize=8)
+    for lbl in ax.get_xticklabels():
+        lbl.set_fontproperties(_fp('light', 7))
+        lbl.set_rotation(45)
+        lbl.set_ha('right')
+    for lbl in ax.get_yticklabels():
+        lbl.set_fontproperties(_fp('light', 8))
 
     ax.set_title("Evolução da Expectativa para o IPCA",
-                 color=WHITE, fontsize=10, pad=8)
-    ax.set_ylabel('%', color=SAGE, fontsize=8)
-    ax.grid(axis='y', color=MID_GRN, alpha=0.3, linewidth=0.5)
+                 color=WHITE, fontproperties=_fp('semi', 10), pad=8)
+    ax.set_ylabel('%', color=SAGE, fontproperties=_fp('light', 8))
+    ax.grid(axis='y', color=MID_GRN, alpha=0.3, linewidth=0.5, zorder=2)
+    ax.tick_params(colors=SAGE)
 
     for spine in ax.spines.values():
         spine.set_edgecolor(MID_GRN)
 
-    ax.tick_params(colors=SAGE)
-    ax.legend(facecolor=BG, edgecolor=MID_GRN, labelcolor=SAGE, fontsize=8)
+    legend_colors = []
+    if serie_2026:
+        legend_colors.append(LIME)
+    if serie_2027:
+        legend_colors.append(SAGE)
+    ax.legend(facecolor=hex_to_rgba(BG, 0.85), edgecolor=MID_GRN,
+              labelcolor=legend_colors, prop=_fp('semi', 9.5))
 
     buf = io.BytesIO()
     plt.savefig(buf, format='PNG', dpi=150, bbox_inches='tight',
@@ -177,7 +235,9 @@ def fmt(valor, decimais=2) -> str:
 def seta(hoje, ant) -> str:
     if hoje is None or ant is None:
         return "-"
-    return "▲" if hoje > ant else ("▼" if hoje < ant else "=")
+    h = round(hoje, 2)
+    a = round(ant, 2)
+    return "▲" if h > a else ("▼" if h < a else "=")
 
 
 def hex_to_rgba(h, a):
@@ -187,39 +247,52 @@ def hex_to_rgba(h, a):
 
 
 def gera_imagem(rows_data: list) -> bytes:
+    blur_img = mpimg.imread(os.path.join(_HERE, 'assets', 'blur', 'blur_65.png'))
+    logo_img = mpimg.imread(os.path.join(_HERE, 'assets', 'logo', 'png01.png'))
+
     headers = ['', 'Ha 4\nsemanas', 'Ha 1\nsemana', 'Hoje', 'Comp.\nsemanal *']
     COL_W   = [1.9, 1.05, 1.05, 0.90, 0.95]
     ROW_H   = 0.52
     TITLE_H = 0.90
+    LOGO_H  = 0.55
     total_w = sum(COL_W)
     FIG_W   = total_w
-    FIG_H   = TITLE_H + ROW_H * len(rows_data)
+    FIG_H   = TITLE_H + ROW_H * len(rows_data) + LOGO_H
     x0      = 0.0
     hoje_x  = x0 + COL_W[0] + COL_W[1] + COL_W[2]
 
-    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H), facecolor=(0,0,0,0))
-    ax.set_facecolor((0,0,0,0))
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H), facecolor=(0, 0, 0, 0))
+    ax.set_facecolor((0, 0, 0, 0))
+    ax.set_zorder(1)
+
+    # Blur + overlay BG a 25% cobrindo toda a figure
+    bg = fig.add_axes([0, 0, 1, 1], zorder=0)
+    bg.imshow(blur_img, aspect='auto')
+    bg.add_patch(patches.Rectangle((0, 0), 1, 1,
+        facecolor=hex_to_rgba(BG, 0.25), edgecolor='none', transform=bg.transAxes))
+    bg.axis('off')
+
     ax.axis('off')
     ax.set_xlim(0, FIG_W)
     ax.set_ylim(0, FIG_H)
 
-    ax.add_patch(patches.Rectangle((x0,0), total_w, FIG_H,
-        facecolor=hex_to_rgba(BG, 0.80), edgecolor='none'))
-
+    # Cabeçalho esquerdo — "Mediana Focus / (BCB)"
     ax.add_patch(patches.Rectangle((x0, FIG_H-TITLE_H), COL_W[0], TITLE_H,
-        facecolor=hex_to_rgba(MID_GRN,1.0), edgecolor='none'))
+        facecolor=hex_to_rgba(MID_GRN, 0.25), edgecolor='none'))
     ax.text(x0+0.10, FIG_H-TITLE_H/2+0.10, 'Mediana Focus',
-        color=WHITE, fontsize=10, fontweight='bold', va='center', ha='left')
+        color=WHITE, fontproperties=_fp('bold', 10), va='center', ha='left')
     ax.text(x0+0.10, FIG_H-TITLE_H/2-0.17, '(BCB)',
-        color=WHITE, fontsize=9.5, fontweight='bold', va='center', ha='left')
+        color=LIME, fontproperties=_fp('light', 9.5), va='center', ha='left')
 
+    # Cabeçalho direito — ano
     hdr_x = x0 + COL_W[0]
     hdr_w = total_w - COL_W[0]
     ax.add_patch(patches.Rectangle((hdr_x, FIG_H-TITLE_H), hdr_w, TITLE_H,
-        facecolor=hex_to_rgba(MID_GRN,1.0), edgecolor='none'))
+        facecolor=hex_to_rgba(MID_GRN, 0.25), edgecolor='none'))
     ax.text(hdr_x+hdr_w/2, FIG_H-0.10, str(datetime.today().year),
-        color=LIME, fontsize=17, fontweight='bold', va='top', ha='center')
+        color=LIME, fontproperties=_fp('xlight', 16), va='top', ha='center')
 
+    # Sub-headers das colunas
     cx = x0
     for i, (h, w) in enumerate(zip(headers, COL_W)):
         if i == 0:
@@ -227,43 +300,53 @@ def gera_imagem(rows_data: list) -> bytes:
             continue
         ax.text(cx+w/2, FIG_H-TITLE_H+0.22, h,
             color=LIME if i==3 else WHITE,
-            fontsize=7 if i==3 else 6.5, fontweight='bold',
+            fontproperties=_fp('semi', 7 if i==3 else 6.5),
             va='center', ha='center', multialignment='center', linespacing=1.2)
         cx += w
 
     ax.plot([hdr_x, hdr_x+hdr_w], [FIG_H-TITLE_H+0.44]*2,
         color=WHITE, linewidth=0.35, alpha=0.35)
 
+    # Linhas de dados
     for r_idx, row in enumerate(rows_data):
         row_y = FIG_H - TITLE_H - ROW_H * (r_idx + 1)
-        fill  = hex_to_rgba(ALT_ROW,1.0) if r_idx%2==0 else hex_to_rgba(BG,0.0)
+        fill  = hex_to_rgba(ALT_ROW, 0.85) if r_idx%2==0 else hex_to_rgba(BG, 0.0)
 
-        ax.add_patch(patches.Rectangle((x0,row_y), total_w, ROW_H,
+        ax.add_patch(patches.Rectangle((x0, row_y), total_w, ROW_H,
             facecolor=fill, edgecolor='none'))
-        ax.add_patch(patches.Rectangle((hoje_x,row_y), COL_W[3], ROW_H,
-            facecolor=hex_to_rgba(LIME,0.10), edgecolor='none'))
+        ax.add_patch(patches.Rectangle((hoje_x, row_y), COL_W[3], ROW_H,
+            facecolor=hex_to_rgba(LIME, 0.10), edgecolor='none'))
 
+        fp_label = _fp('semi', 7.8) if r_idx%2==1 else _fp('reg', 7.8)
         ax.text(x0+0.10, row_y+ROW_H/2, row["label"],
-            color=WHITE, fontsize=7.8,
-            fontweight='bold' if r_idx%2==1 else 'normal',
-            va='center', ha='left')
+            color=WHITE, fontproperties=fp_label, va='center', ha='left')
 
         cx = x0 + COL_W[0]
         for col_i, (val, w) in enumerate(zip(
                 [row["v4"], row["v1"], row["hoje"]], COL_W[1:4])):
+            fp_val = _fp('bold', 11 if col_i==2 else 8.5)
             ax.text(cx+w/2, row_y+ROW_H/2, val,
                 color=LIME if col_i==2 else SAGE,
-                fontsize=11 if col_i==2 else 8.5, fontweight='bold',
-                va='center', ha='center')
+                fontproperties=fp_val, va='center', ha='center')
             cx += w
 
         if row.get("comp"):
             ac = LIME if '▲' in row["comp"] else SAGE
             ax.text(cx+COL_W[4]/2, row_y+ROW_H/2, row["comp"],
-                color=ac, fontsize=8.5, fontweight='bold',
-                va='center', ha='center')
+                color=ac, fontsize=8.5, fontweight='semibold', va='center', ha='center')
 
         ax.plot([x0, x0+total_w], [row_y]*2, color=MID_GRN, linewidth=0.4, alpha=0.5)
+
+    # Logo no rodapé (alinhado à esquerda)
+    logo_h  = LOGO_H * 0.65
+    logo_w  = logo_h * (logo_img.shape[1] / logo_img.shape[0])
+    logo_x  = x0 + 0.10
+    logo_y  = (LOGO_H - logo_h) / 2
+    ax.imshow(logo_img, extent=[logo_x, logo_x+logo_w, logo_y, logo_y+logo_h],
+              aspect='auto', origin='upper', zorder=5)
+    # Restaura limites após imshow
+    ax.set_xlim(0, FIG_W)
+    ax.set_ylim(0, FIG_H)
 
     buf = io.BytesIO()
     plt.savefig(buf, format='PNG', dpi=300, transparent=True,
@@ -319,9 +402,9 @@ def envia_email(imagem_bytes: bytes, grafico_bytes: bytes):
 def main():
     print("Buscando dados do Focus (BCB)...")
 
-    sf0 = ultima_sexta(0)
-    sf1 = ultima_sexta(1)
-    sf4 = ultima_sexta(4)
+    sf0 = ultima_publicacao(0)
+    sf1 = ultima_publicacao(1)
+    sf4 = ultima_publicacao(4)
     print(f"  Datas: {sf4} | {sf1} | {sf0}")
 
     ipca_h = busca_focus("IPCA", sf0)
