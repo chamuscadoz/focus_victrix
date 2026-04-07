@@ -2,7 +2,7 @@ name: Focus Victrix Semanal
 
 on:
   schedule:
-    - cron: '30 13 * * 1'  # segunda-feira 10h30 horário de Brasília (UTC-3)
+    - cron: '30 13 * * 1-5'  # seg-sex 10h30 Brasília — só envia se houver publicação nova
   workflow_dispatch:        # permite rodar manualmente também
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
           python-version: '3.12'
 
       - name: Instalar dependências
-        run: pip install requests matplotlib Pillow
+        run: pip install requests matplotlib Pillow holidays
 
       - name: Rodar script
         env:

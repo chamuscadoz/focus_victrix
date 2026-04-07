@@ -9,6 +9,7 @@ import smtplib
 import os
 import io
 from datetime import datetime, timedelta
+import holidays
 from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
 from email.mime.text import MIMEText
@@ -22,7 +23,7 @@ import matplotlib.font_manager as fm
 import matplotlib.image as mpimg
 
 EMAIL_ORIGEM  = "z.cassiolato@gmail.com"
-BCC_DESTINOS   = "jvpcassiolato@gmail.com, z.cassiolato@gmail.com, jcassiolato@victrixcapital.com.br, gjesus@victrixcapital.com.br, ggiron@victrixcapital.com.br, rscassiolato@gmail.com, bperroni@gmail.com, rafaferro@gmail.com"
+BCC_DESTINOS   = "jvpcassiolato@gmail.com, jcassiolato@victrixcapital.com.br, gjesus@victrixcapital.com.br, ggiron@victrixcapital.com.br, rscassiolato@gmail.com, bperroni@gmail.com, rafaferro@gmail.com"
 SENHA_APP     = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
 BG      = '#0E1C0E'
@@ -159,68 +160,76 @@ def busca_historico_ipca(ano_ref: int) -> list:
 def gera_grafico_ipca(serie_2026: list, serie_2027: list) -> bytes:
     blur_img = mpimg.imread(os.path.join(_HERE, 'assets', 'blur', 'blur_65.png'))
 
-    fig, ax = plt.subplots(figsize=(7, 3.5), facecolor=BG)
+    fig, ax = plt.subplots(figsize=(7, 3.5), facecolor=(0, 0, 0, 0))
     ax.set_facecolor('none')
+    ax.set_zorder(1)
 
-    # Blur + overlay no fundo (cobre toda a figure)
+    # Blur cobrindo toda a figure + overlay BG a 25% (igual à tabela)
     bg = fig.add_axes([0, 0, 1, 1], zorder=0)
     bg.imshow(blur_img, aspect='auto')
     bg.add_patch(patches.Rectangle((0, 0), 1, 1,
-        facecolor=hex_to_rgba(BG, 0.72), edgecolor='none', transform=bg.transAxes))
+        facecolor=hex_to_rgba(BG, 0.25), edgecolor='none', transform=bg.transAxes))
     bg.axis('off')
 
-    ax.set_zorder(1)
-
+    # Plota as séries
+    all_vals = []
     if serie_2026:
         datas_26 = [datetime.strptime(d, "%Y-%m-%d") for d, _ in serie_2026]
         vals_26  = [v for _, v in serie_2026]
+        all_vals += vals_26
         ax.plot(datas_26, vals_26, color=LIME, linewidth=2.8, label='IPCA 2026', zorder=3)
         ax.plot(datas_26[-1], vals_26[-1], 'o', color=LIME, markersize=5, zorder=4)
         ax.annotate(f"{fmt(vals_26[-1])}%",
                     xy=(datas_26[-1], vals_26[-1]), xytext=(8, 0),
                     textcoords='offset points', color=LIME,
-                    fontproperties=_fp('bold', 9.5), va='center', zorder=4)
+                    fontproperties=_fp('bold', 11), va='center', zorder=4)
 
     if serie_2027:
         datas_27 = [datetime.strptime(d, "%Y-%m-%d") for d, _ in serie_2027]
         vals_27  = [v for _, v in serie_2027]
+        all_vals += vals_27
         ax.plot(datas_27, vals_27, color=SAGE, linewidth=2.0, linestyle='--',
                 label='IPCA 2027', zorder=3)
         ax.plot(datas_27[-1], vals_27[-1], 'o', color=SAGE, markersize=5, zorder=4)
         ax.annotate(f"{fmt(vals_27[-1])}%",
                     xy=(datas_27[-1], vals_27[-1]), xytext=(8, 0),
                     textcoords='offset points', color=SAGE,
-                    fontproperties=_fp('bold', 9.5), va='center', zorder=4)
+                    fontproperties=_fp('bold', 11), va='center', zorder=4)
+
+    # Eixo Y ajustado para destacar variações (sem partir do zero)
+    if all_vals:
+        margem = (max(all_vals) - min(all_vals)) * 0.25 or 0.1
+        ax.set_ylim(min(all_vals) - margem, max(all_vals) + margem)
 
     ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=4, interval=4))
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%b/%y'))
     for lbl in ax.get_xticklabels():
-        lbl.set_fontproperties(_fp('light', 7))
+        lbl.set_fontproperties(_fp('light', 9))
         lbl.set_rotation(45)
         lbl.set_ha('right')
     for lbl in ax.get_yticklabels():
-        lbl.set_fontproperties(_fp('light', 8))
+        lbl.set_fontproperties(_fp('light', 9))
 
     ax.set_title("Evolução da Expectativa para o IPCA",
-                 color=WHITE, fontproperties=_fp('semi', 10), pad=8)
-    ax.set_ylabel('%', color=SAGE, fontproperties=_fp('light', 8))
-    ax.grid(axis='y', color=MID_GRN, alpha=0.3, linewidth=0.5, zorder=2)
+                 color=WHITE, fontproperties=_fp('semi', 13), pad=10)
+    ax.set_ylabel('%', color=SAGE, fontproperties=_fp('light', 9))
+    ax.grid(axis='y', color=MID_GRN, alpha=0.4, linewidth=0.5, zorder=2)
     ax.tick_params(colors=SAGE)
 
     for spine in ax.spines.values():
-        spine.set_edgecolor(MID_GRN)
+        spine.set_visible(False)
 
     legend_colors = []
     if serie_2026:
         legend_colors.append(LIME)
     if serie_2027:
         legend_colors.append(SAGE)
-    ax.legend(facecolor=hex_to_rgba(BG, 0.85), edgecolor=MID_GRN,
-              labelcolor=legend_colors, prop=_fp('semi', 9.5))
+    ax.legend(facecolor=hex_to_rgba(BG, 0.85), edgecolor='none',
+              labelcolor=legend_colors, prop=_fp('semi', 11))
 
     buf = io.BytesIO()
     plt.savefig(buf, format='PNG', dpi=150, bbox_inches='tight',
-                pad_inches=0.15, facecolor=BG)
+                pad_inches=0.15, transparent=True)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -399,8 +408,43 @@ def envia_email(imagem_bytes: bytes, grafico_bytes: bytes):
     print(f"Email enviado para {BCC_DESTINOS}")
 
 
+def e_dia_util_com_publicacao() -> bool:
+    """Verifica se hoje tem publicação nova do Focus. Aborta em feriados e fins de semana."""
+    hoje = datetime.today().date()
+    br_holidays = holidays.Brazil(years=hoje.year)
+
+    if hoje in br_holidays or hoje.weekday() >= 5:
+        print(f"Hoje ({hoje}) é feriado ou fim de semana. Nenhum envio.")
+        return False
+
+    for dias_atras in range(0, 5):
+        data_check = hoje - timedelta(days=dias_atras)
+        if data_check in br_holidays or data_check.weekday() >= 5:
+            continue
+        url = (
+            "https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/"
+            "ExpectativasMercadoAnuais"
+            f"?$filter=Indicador eq 'IPCA' and Data eq '{data_check}' and baseCalculo eq 0"
+            "&$top=1&$select=Data&$format=json"
+        )
+        try:
+            r = requests.get(url, timeout=15)
+            dados = r.json().get("value", [])
+            if dados:
+                print(f"Publicação encontrada para {data_check}. Prosseguindo.")
+                return True
+        except Exception:
+            continue
+
+    print("Nenhuma publicação nova encontrada. Nenhum envio.")
+    return False
+
+
 def main():
     print("Buscando dados do Focus (BCB)...")
+
+    if not e_dia_util_com_publicacao():
+        return
 
     sf0 = ultima_publicacao(0)
     sf1 = ultima_publicacao(1)
