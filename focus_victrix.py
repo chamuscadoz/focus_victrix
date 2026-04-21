@@ -1,500 +1,137 @@
 """
 focus_victrix.py
-Busca dados do Relatório Focus (BCB), gera tabela no estilo Victrix Capital
-e envia por email.
+Orquestrador principal: ingere dados, monta tabela/gráfico, envia email.
+
+Uso:
+    python focus_victrix.py                 # roda tudo (ingest + render + email)
+    python focus_victrix.py --skip-email    # gera PNGs mas não envia
+    python focus_victrix.py --skip-ingest   # usa apenas base local (offline)
+    python focus_victrix.py --dry-run       # loga o que faria sem rodar email
 """
 
-import requests
-import smtplib
+from __future__ import annotations
+
+import argparse
+import logging
 import os
-import io
+import sys
 from datetime import datetime, timedelta
+
 import holidays
-from email.mime.multipart import MIMEMultipart
-from email.mime.image import MIMEImage
-from email.mime.text import MIMEText
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import matplotlib.dates as mdates
-import matplotlib.font_manager as fm
-import matplotlib.image as mpimg
+from src import ingest, mailer, query, render, storage
 
-EMAIL_ORIGEM  = "z.cassiolato@gmail.com"
-BCC_DESTINOS   = "jvpcassiolato@gmail.com, jcassiolato@victrixcapital.com.br, gjesus@victrixcapital.com.br, ggiron@victrixcapital.com.br, rscassiolato@gmail.com, bperroni@gmail.com, rafaferro@gmail.com"
-SENHA_APP     = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
-
-BG      = '#0E1C0E'
-LIME    = '#88E833'
-MID_GRN = '#2E6F3A'
-SAGE    = '#D5DAD0'
-WHITE   = '#FFFFFF'
-ALT_ROW = '#152615'
-
-_HERE     = os.path.dirname(os.path.abspath(__file__))
-_FONT_PFX = os.path.join(_HERE, 'assets', 'font', 'static', 'ZalandoSansSemiExpanded-')
-_FONT_MAP = {'reg': 'Regular', 'semi': 'SemiBold', 'bold': 'Bold',
-             'light': 'Light', 'xlight': 'ExtraLight'}
-
-
-def _fp(style: str, size: float) -> fm.FontProperties:
-    p = fm.FontProperties(fname=_FONT_PFX + _FONT_MAP[style] + '.ttf')
-    p.set_size(size)
-    return p
-
-
-def ultima_publicacao(publicacoes_atras: int = 0) -> str:
-    """Busca diretamente na API as datas de publicação disponíveis.
-    Funciona independente do dia da semana — cobre feriados."""
-    url = (
-        "https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/"
-        "ExpectativasMercadoAnuais"
-        "?$filter=Indicador eq 'IPCA' and baseCalculo eq 0"
-        "&$select=Data&$format=json&$orderby=Data desc&$top=50"
-    )
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        datas = sorted(set(d["Data"] for d in r.json().get("value", [])), reverse=True)
-        if len(datas) > publicacoes_atras:
-            return datas[publicacoes_atras]
-    except Exception as e:
-        print(f"Erro ao buscar última publicação: {e}")
-    hoje = datetime.today()
-    return (hoje - timedelta(days=hoje.weekday() + publicacoes_atras * 7)).strftime("%Y-%m-%d")
-
-
-def busca_focus(indicador: str, data_ref: str):
-    url = (
-        "https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/"
-        "ExpectativasMercadoAnuais"
-        f"?$top=1"
-        f"&$filter=Indicador eq '{indicador}' and Data eq '{data_ref}' and baseCalculo eq 0"
-        "&$select=Mediana"
-        "&$format=json"
-        "&$orderby=Data desc"
-    )
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        dados = r.json().get("value", [])
-        if dados:
-            return float(dados[0]["Mediana"])
-    except Exception as e:
-        print(f"Erro {indicador} ({data_ref}): {e}")
-    return None
-
-
-def busca_selic(data_ref: str):
-    ano = datetime.today().year
-    reuniao = f"R8/{ano}"
-    url = (
-        "https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/"
-        "ExpectativasMercadoSelic"
-        f"?$top=1"
-        f"&$filter=Data eq '{data_ref}' and Reuniao eq '{reuniao}'"
-        "&$select=Mediana"
-        "&$format=json"
-    )
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        dados = r.json().get("value", [])
-        if dados:
-            return float(dados[0]["Mediana"])
-    except Exception as e:
-        print(f"Erro Selic ({data_ref}): {e}")
-    return None
-
-
-def busca_cambio(data_ref: str):
-    url = (
-        "https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/"
-        "ExpectativasMercadoAnuais"
-        f"?$top=1"
-        f"&$filter=Indicador eq 'C%C3%A2mbio' and Data eq '{data_ref}' and baseCalculo eq 0"
-        "&$select=Mediana"
-        "&$format=json"
-        "&$orderby=Data desc"
-    )
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        dados = r.json().get("value", [])
-        if dados:
-            return float(dados[0]["Mediana"])
-    except Exception as e:
-        print(f"Erro Cambio ({data_ref}): {e}")
-    return None
-
-
-def busca_historico_ipca(ano_ref: int) -> list:
-    """Retorna lista de (data_str, mediana) para expectativa de IPCA de `ano_ref`, últimas 52 semanas."""
-    data_inicio = (datetime.today() - timedelta(weeks=52)).strftime("%Y-%m-%d")
-    url = (
-        "https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/"
-        "ExpectativasMercadoAnuais"
-        f"?$filter=Indicador eq 'IPCA' and DataReferencia eq '{ano_ref}' and Data ge '{data_inicio}' and baseCalculo eq 0"
-        "&$select=Data,Mediana"
-        "&$format=json"
-    )
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        dados = r.json().get("value", [])
-        resultado = []
-        for d in dados:
-            try:
-                resultado.append((d["Data"], float(d["Mediana"])))
-            except (KeyError, TypeError, ValueError):
-                continue
-        resultado.sort(key=lambda x: x[0])
-        return resultado
-    except Exception as e:
-        print(f"Erro histórico IPCA {ano_ref}: {e}")
-        return []
-
-
-def gera_grafico_ipca(serie_2026: list, serie_2027: list) -> bytes:
-    blur_img = mpimg.imread(os.path.join(_HERE, 'assets', 'blur', 'blur_65.png'))
-
-    fig, ax = plt.subplots(figsize=(7, 3.5), facecolor=(0, 0, 0, 0))
-    ax.set_facecolor('none')
-    ax.set_zorder(1)
-
-    # Blur cobrindo toda a figure + overlay BG a 25% (igual à tabela)
-    bg = fig.add_axes([0, 0, 1, 1], zorder=0)
-    bg.imshow(blur_img, aspect='auto')
-    bg.add_patch(patches.Rectangle((0, 0), 1, 1,
-        facecolor=hex_to_rgba(BG, 0.25), edgecolor='none', transform=bg.transAxes))
-    bg.axis('off')
-
-    # Plota as séries
-    all_vals = []
-    if serie_2026:
-        datas_26 = [datetime.strptime(d, "%Y-%m-%d") for d, _ in serie_2026]
-        vals_26  = [v for _, v in serie_2026]
-        all_vals += vals_26
-        ax.plot(datas_26, vals_26, color=LIME, linewidth=2.8, label='IPCA 2026', zorder=3)
-        ax.plot(datas_26[-1], vals_26[-1], 'o', color=LIME, markersize=5, zorder=4)
-        ax.annotate(f"{fmt(vals_26[-1])}%",
-                    xy=(datas_26[-1], vals_26[-1]), xytext=(8, 0),
-                    textcoords='offset points', color=LIME,
-                    fontproperties=_fp('bold', 11), va='center', zorder=4)
-
-    if serie_2027:
-        datas_27 = [datetime.strptime(d, "%Y-%m-%d") for d, _ in serie_2027]
-        vals_27  = [v for _, v in serie_2027]
-        all_vals += vals_27
-        ax.plot(datas_27, vals_27, color=SAGE, linewidth=2.0, linestyle='--',
-                label='IPCA 2027', zorder=3)
-        ax.plot(datas_27[-1], vals_27[-1], 'o', color=SAGE, markersize=5, zorder=4)
-        ax.annotate(f"{fmt(vals_27[-1])}%",
-                    xy=(datas_27[-1], vals_27[-1]), xytext=(8, 0),
-                    textcoords='offset points', color=SAGE,
-                    fontproperties=_fp('bold', 11), va='center', zorder=4)
-
-    # Eixo Y ajustado para destacar variações (sem partir do zero)
-    if all_vals:
-        margem = (max(all_vals) - min(all_vals)) * 0.25 or 0.1
-        ax.set_ylim(min(all_vals) - margem, max(all_vals) + margem)
-
-    ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=4, interval=4))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b/%y'))
-    for lbl in ax.get_xticklabels():
-        lbl.set_fontproperties(_fp('light', 9))
-        lbl.set_rotation(45)
-        lbl.set_ha('right')
-    for lbl in ax.get_yticklabels():
-        lbl.set_fontproperties(_fp('light', 9))
-
-    ax.set_title("Evolução da Expectativa para o IPCA",
-                 color=WHITE, fontproperties=_fp('semi', 13), pad=10)
-    ax.set_ylabel('%', color=SAGE, fontproperties=_fp('light', 9))
-    ax.grid(axis='y', color=MID_GRN, alpha=0.4, linewidth=0.5, zorder=2)
-    ax.tick_params(colors=SAGE)
-
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-
-    legend_colors = []
-    if serie_2026:
-        legend_colors.append(LIME)
-    if serie_2027:
-        legend_colors.append(SAGE)
-    ax.legend(facecolor=hex_to_rgba(BG, 0.85), edgecolor='none',
-              labelcolor=legend_colors, prop=_fp('semi', 11))
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format='PNG', dpi=150, bbox_inches='tight',
-                pad_inches=0.15, transparent=True)
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
-
-
-def fmt(valor, decimais=2) -> str:
-    if valor is None:
-        return "-"
-    return f"{valor:,.{decimais}f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def seta(hoje, ant) -> str:
-    if hoje is None or ant is None:
-        return "-"
-    h = round(hoje, 2)
-    a = round(ant, 2)
-    return "▲" if h > a else ("▼" if h < a else "=")
-
-
-def hex_to_rgba(h, a):
-    h = h.lstrip('#')
-    r, g, b = tuple(int(h[i:i+2], 16) / 255 for i in (0, 2, 4))
-    return (r, g, b, a)
-
-
-def gera_imagem(rows_data: list) -> bytes:
-    blur_img = mpimg.imread(os.path.join(_HERE, 'assets', 'blur', 'blur_65.png'))
-    logo_img = mpimg.imread(os.path.join(_HERE, 'assets', 'logo', 'png01.png'))
-
-    headers = ['', 'Ha 4\nsemanas', 'Ha 1\nsemana', 'Hoje', 'Comp.\nsemanal *']
-    COL_W   = [1.9, 1.05, 1.05, 0.90, 0.95]
-    ROW_H   = 0.52
-    TITLE_H = 0.90
-    LOGO_H  = 0.55
-    total_w = sum(COL_W)
-    FIG_W   = total_w
-    FIG_H   = TITLE_H + ROW_H * len(rows_data) + LOGO_H
-    x0      = 0.0
-    hoje_x  = x0 + COL_W[0] + COL_W[1] + COL_W[2]
-
-    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H), facecolor=(0, 0, 0, 0))
-    ax.set_facecolor((0, 0, 0, 0))
-    ax.set_zorder(1)
-
-    # Blur + overlay BG a 25% cobrindo toda a figure
-    bg = fig.add_axes([0, 0, 1, 1], zorder=0)
-    bg.imshow(blur_img, aspect='auto')
-    bg.add_patch(patches.Rectangle((0, 0), 1, 1,
-        facecolor=hex_to_rgba(BG, 0.25), edgecolor='none', transform=bg.transAxes))
-    bg.axis('off')
-
-    ax.axis('off')
-    ax.set_xlim(0, FIG_W)
-    ax.set_ylim(0, FIG_H)
-
-    # Cabeçalho esquerdo — "Mediana Focus / (BCB)"
-    ax.add_patch(patches.Rectangle((x0, FIG_H-TITLE_H), COL_W[0], TITLE_H,
-        facecolor=hex_to_rgba(MID_GRN, 0.25), edgecolor='none'))
-    ax.text(x0+0.10, FIG_H-TITLE_H/2+0.10, 'Mediana Focus',
-        color=WHITE, fontproperties=_fp('bold', 10), va='center', ha='left')
-    ax.text(x0+0.10, FIG_H-TITLE_H/2-0.17, '(BCB)',
-        color=LIME, fontproperties=_fp('light', 9.5), va='center', ha='left')
-
-    # Cabeçalho direito — ano
-    hdr_x = x0 + COL_W[0]
-    hdr_w = total_w - COL_W[0]
-    ax.add_patch(patches.Rectangle((hdr_x, FIG_H-TITLE_H), hdr_w, TITLE_H,
-        facecolor=hex_to_rgba(MID_GRN, 0.25), edgecolor='none'))
-    ax.text(hdr_x+hdr_w/2, FIG_H-0.10, str(datetime.today().year),
-        color=LIME, fontproperties=_fp('xlight', 16), va='top', ha='center')
-
-    # Sub-headers das colunas
-    cx = x0
-    for i, (h, w) in enumerate(zip(headers, COL_W)):
-        if i == 0:
-            cx += w
-            continue
-        ax.text(cx+w/2, FIG_H-TITLE_H+0.22, h,
-            color=LIME if i==3 else WHITE,
-            fontproperties=_fp('semi', 7 if i==3 else 6.5),
-            va='center', ha='center', multialignment='center', linespacing=1.2)
-        cx += w
-
-    ax.plot([hdr_x, hdr_x+hdr_w], [FIG_H-TITLE_H+0.44]*2,
-        color=WHITE, linewidth=0.35, alpha=0.35)
-
-    # Linhas de dados
-    for r_idx, row in enumerate(rows_data):
-        row_y = FIG_H - TITLE_H - ROW_H * (r_idx + 1)
-        fill  = hex_to_rgba(ALT_ROW, 0.85) if r_idx%2==0 else hex_to_rgba(BG, 0.0)
-
-        ax.add_patch(patches.Rectangle((x0, row_y), total_w, ROW_H,
-            facecolor=fill, edgecolor='none'))
-        ax.add_patch(patches.Rectangle((hoje_x, row_y), COL_W[3], ROW_H,
-            facecolor=hex_to_rgba(LIME, 0.10), edgecolor='none'))
-
-        fp_label = _fp('semi', 7.8) if r_idx%2==1 else _fp('reg', 7.8)
-        ax.text(x0+0.10, row_y+ROW_H/2, row["label"],
-            color=WHITE, fontproperties=fp_label, va='center', ha='left')
-
-        cx = x0 + COL_W[0]
-        for col_i, (val, w) in enumerate(zip(
-                [row["v4"], row["v1"], row["hoje"]], COL_W[1:4])):
-            fp_val = _fp('bold', 11 if col_i==2 else 8.5)
-            ax.text(cx+w/2, row_y+ROW_H/2, val,
-                color=LIME if col_i==2 else SAGE,
-                fontproperties=fp_val, va='center', ha='center')
-            cx += w
-
-        if row.get("comp"):
-            ac = LIME if '▲' in row["comp"] else SAGE
-            ax.text(cx+COL_W[4]/2, row_y+ROW_H/2, row["comp"],
-                color=ac, fontsize=8.5, fontweight='semibold', va='center', ha='center')
-
-        ax.plot([x0, x0+total_w], [row_y]*2, color=MID_GRN, linewidth=0.4, alpha=0.5)
-
-    # Logo no rodapé (alinhado à esquerda)
-    logo_h  = LOGO_H * 0.65
-    logo_w  = logo_h * (logo_img.shape[1] / logo_img.shape[0])
-    logo_x  = x0 + 0.10
-    logo_y  = (LOGO_H - logo_h) / 2
-    ax.imshow(logo_img, extent=[logo_x, logo_x+logo_w, logo_y, logo_y+logo_h],
-              aspect='auto', origin='upper', zorder=5)
-    # Restaura limites após imshow
-    ax.set_xlim(0, FIG_W)
-    ax.set_ylim(0, FIG_H)
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format='PNG', dpi=300, transparent=True,
-        bbox_inches='tight', pad_inches=0.0)
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
-
-
-def envia_email(imagem_bytes: bytes, grafico_bytes: bytes):
-    data_str = datetime.today().strftime("%d/%m/%Y")
-    msg = MIMEMultipart("related")
-    msg["Subject"] = f"Victrix Capital - Mediana Focus (BCB) | {data_str}"
-    msg["From"]    = EMAIL_ORIGEM
-    msg["To"]      = EMAIL_ORIGEM
-    msg["Bcc"]     = BCC_DESTINOS
-
-    html = f"""
-    <html><body style="background:#0E1C0E;padding:24px;">
-      <p style="color:#D5DAD0;font-family:Arial,sans-serif;font-size:13px;">
-        Bom dia,<br><br>
-        Segue a tabela semanal <strong style="color:#88E833;">Mediana Focus (BCB)</strong>
-        de {data_str}, com o histórico de expectativa do IPCA para 2026 e 2027.
-      </p>
-      <img src="cid:tabela_focus" style="max-width:600px;border-radius:4px;"/>
-      <br><br>
-      <img src="cid:grafico_ipca" style="max-width:600px;border-radius:4px;"/>
-      <p style="color:#2E6F3A;font-family:Arial,sans-serif;font-size:10px;margin-top:16px;">
-        Victrix Capital
-      </p>
-    </body></html>
-    """
-    msg.attach(MIMEText(html, "html"))
-
-    img_part = MIMEImage(imagem_bytes, name="focus_victrix.png")
-    img_part.add_header("Content-ID", "<tabela_focus>")
-    img_part.add_header("Content-Disposition", "inline", filename="focus_victrix.png")
-    msg.attach(img_part)
-
-    graf_part = MIMEImage(grafico_bytes, name="grafico_ipca.png")
-    graf_part.add_header("Content-ID", "<grafico_ipca>")
-    graf_part.add_header("Content-Disposition", "inline", filename="grafico_ipca.png")
-    msg.attach(graf_part)
-
-    senha = SENHA_APP.encode('ascii', errors='ignore').decode('ascii')
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(EMAIL_ORIGEM, senha)
-        todos = BCC_DESTINOS.split(", ")
-        smtp.sendmail(EMAIL_ORIGEM, todos, msg.as_string())
-    print(f"Email enviado para {BCC_DESTINOS}")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("focus_victrix")
 
 
 def e_dia_util_com_publicacao() -> bool:
-    """Verifica se hoje tem publicação nova do Focus. Aborta em feriados e fins de semana."""
     hoje = datetime.today().date()
     br_holidays = holidays.Brazil(years=hoje.year)
-
     if hoje in br_holidays or hoje.weekday() >= 5:
-        print(f"Hoje ({hoje}) é feriado ou fim de semana. Nenhum envio.")
+        logger.info("Hoje (%s) é feriado ou fim de semana. Abortando.", hoje)
         return False
-
-    for dias_atras in range(0, 5):
-        data_check = hoje - timedelta(days=dias_atras)
-        if data_check in br_holidays or data_check.weekday() >= 5:
-            continue
-        url = (
-            "https://olinda.bcb.gov.br/olinda/servico/Expectativas/versao/v1/odata/"
-            "ExpectativasMercadoAnuais"
-            f"?$filter=Indicador eq 'IPCA' and Data eq '{data_check}' and baseCalculo eq 0"
-            "&$top=1&$select=Data&$format=json"
-        )
-        try:
-            r = requests.get(url, timeout=15)
-            dados = r.json().get("value", [])
-            if dados:
-                print(f"Publicação encontrada para {data_check}. Prosseguindo.")
-                return True
-        except Exception:
-            continue
-
-    print("Nenhuma publicação nova encontrada. Nenhum envio.")
-    return False
+    if not ingest.existe_publicacao_recente(dias=7):
+        logger.info("Nenhuma publicação recente encontrada. Abortando.")
+        return False
+    return True
 
 
-def main():
-    print("Buscando dados do Focus (BCB)...")
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--skip-ingest", action="store_true",
+                        help="Não busca novos dados da API; usa base local.")
+    parser.add_argument("--skip-email", action="store_true",
+                        help="Gera PNGs mas não envia email.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Alias para --skip-email.")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignora checagem de dia útil/publicação.")
+    args = parser.parse_args()
 
-    if not e_dia_util_com_publicacao():
-        return
+    if not args.force and not args.skip_ingest:
+        if not e_dia_util_com_publicacao():
+            return 0
 
-    sf0 = ultima_publicacao(0)
-    sf1 = ultima_publicacao(1)
-    sf4 = ultima_publicacao(4)
-    print(f"  Datas: {sf4} | {sf1} | {sf0}")
+    # --- INGEST
+    if not args.skip_ingest:
+        logger.info("Ingerindo dados do BCB...")
+        stats = ingest.ingerir_semana()
+        logger.info("Ingestão concluída: %s", stats)
+    else:
+        logger.info("Ingestão pulada (--skip-ingest).")
 
-    ipca_h = busca_focus("IPCA", sf0)
-    ipca_1 = busca_focus("IPCA", sf1)
-    ipca_4 = busca_focus("IPCA", sf4)
+    # --- CARREGA BASE
+    df_anuais = storage.load_anuais()
+    df_selic = storage.load_selic()
+    logger.info("Base local: %d linhas anuais | %d linhas selic",
+                len(df_anuais), len(df_selic))
+    if df_anuais.empty:
+        logger.error("Base anual vazia. Rode com --force ou verifique a API.")
+        return 1
 
-    pib_h  = busca_focus("PIB Total", sf0)
-    pib_1  = busca_focus("PIB Total", sf1)
-    pib_4  = busca_focus("PIB Total", sf4)
+    # --- QUERY
+    datas = query.tres_datas(df_anuais)
+    logger.info("Datas: hoje=%s | -1sem=%s | -4sem=%s | -8sem=%s",
+                datas.hoje, datas.uma_semana, datas.quatro_semanas, datas.oito_semanas)
 
-    cam_h  = busca_cambio(sf0)
-    cam_1  = busca_cambio(sf1)
-    cam_4  = busca_cambio(sf4)
+    ano_tabela = (datas.hoje or datetime.today().date()).year
+    linhas = query.montar_linhas(df_anuais, df_selic, datas, ano_ref=ano_tabela)
 
-    sel_h  = busca_selic(sf0)
-    sel_1  = busca_selic(sf1)
-    sel_4  = busca_selic(sf4)
+    # Converte para o formato do render
+    rows_data = []
+    for linha in linhas:
+        seta = render.seta(linha.hoje, linha.v1)
+        comp = f"{seta} {linha.streak}s" if seta in ("▲", "▼") and linha.streak > 0 else seta
+        rows_data.append({
+            "label": linha.label,
+            "v8": render.fmt(linha.v8),
+            "v4": render.fmt(linha.v4),
+            "v1": render.fmt(linha.v1),
+            "hoje": render.fmt(linha.hoje),
+            "comp": comp,
+        })
 
-    rows_data = [
-        {"label": "IPCA (variacao %)",  "v4": fmt(ipca_4), "v1": fmt(ipca_1), "hoje": fmt(ipca_h), "comp": seta(ipca_h, ipca_1)},
-        {"label": "PIB (variacao %)",   "v4": fmt(pib_4),  "v1": fmt(pib_1),  "hoje": fmt(pib_h),  "comp": seta(pib_h, pib_1)},
-        {"label": "Cambio (USDBRL)",    "v4": fmt(cam_4),  "v1": fmt(cam_1),  "hoje": fmt(cam_h),  "comp": seta(cam_h, cam_1)},
-        {"label": "Selic (% ao ano)",   "v4": fmt(sel_4),  "v1": fmt(sel_1),  "hoje": fmt(sel_h),  "comp": seta(sel_h, sel_1)},
-    ]
+    # --- HISTÓRICO PARA OS GRÁFICOS
+    hist_ipca_atual = storage.historico_anual(df_anuais, "IPCA", ano_tabela, semanas=52)
+    hist_ipca_prox = storage.historico_anual(df_anuais, "IPCA", ano_tabela + 1, semanas=52)
+    hist_selic_atual = storage.historico_anual(df_anuais, "Selic", ano_tabela, semanas=52)
+    hist_selic_prox = storage.historico_anual(df_anuais, "Selic", ano_tabela + 1, semanas=52)
+    logger.info("Histórico IPCA: %d pontos (%d) | %d pontos (%d)",
+                len(hist_ipca_atual), ano_tabela, len(hist_ipca_prox), ano_tabela + 1)
+    logger.info("Histórico Selic: %d pontos (%d) | %d pontos (%d)",
+                len(hist_selic_atual), ano_tabela, len(hist_selic_prox), ano_tabela + 1)
 
-    print("Buscando histórico IPCA 2026 e 2027...")
-    hist_2026 = busca_historico_ipca(2026)
-    hist_2027 = busca_historico_ipca(2027)
-    print(f"  IPCA 2026: {len(hist_2026)} pontos | IPCA 2027: {len(hist_2027)} pontos")
-
-    print("Gerando imagem...")
-    imagem = gera_imagem(rows_data)
+    # --- RENDER
+    logger.info("Gerando tabela...")
+    img_bytes = render.gera_imagem(rows_data, ano_tabela=ano_tabela)
     with open("focus_victrix_output.png", "wb") as f:
-        f.write(imagem)
-    print("Imagem salva: focus_victrix_output.png")
+        f.write(img_bytes)
 
-    print("Gerando gráfico IPCA...")
-    grafico = gera_grafico_ipca(hist_2026, hist_2027)
+    logger.info("Gerando gráfico IPCA...")
+    graf_ipca_bytes = render.gera_grafico_ipca(hist_ipca_atual, hist_ipca_prox)
     with open("focus_victrix_grafico.png", "wb") as f:
-        f.write(grafico)
-    print("Gráfico salvo: focus_victrix_grafico.png")
+        f.write(graf_ipca_bytes)
 
-    print("Enviando email...")
-    envia_email(imagem, grafico)
-    print("Concluido.")
+    logger.info("Gerando gráfico Selic...")
+    graf_selic_bytes = render.gera_grafico_selic(hist_selic_atual, hist_selic_prox)
+    with open("focus_victrix_selic.png", "wb") as f:
+        f.write(graf_selic_bytes)
+
+    # --- EMAIL
+    if args.skip_email or args.dry_run:
+        logger.info("Email pulado (skip-email/dry-run).")
+        return 0
+
+    logger.info("Enviando email...")
+    mailer.envia_email(img_bytes, graf_ipca_bytes, graf_selic_bytes)
+    logger.info("Concluído.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
