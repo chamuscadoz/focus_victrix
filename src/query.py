@@ -44,15 +44,13 @@ def tres_datas(df_anuais: pd.DataFrame, referencia: Optional[date] = None) -> Tr
 
     hoje = storage.data_mais_proxima(df_anuais, referencia, tolerancia_dias=10)
 
-    # Usa `hoje` (último dado real) como âncora para garantir offsets corretos,
-    # independente de dados diários que possam existir na mesma semana.
     uma: Optional[date] = None
     quatro: Optional[date] = None
     oito: Optional[date] = None
     if hoje is not None:
-        uma    = _data_ate(df_anuais, hoje - timedelta(days=7),  tolerancia=7)
-        quatro = _data_ate(df_anuais, hoje - timedelta(days=28), tolerancia=7)
-        oito   = _data_ate(df_anuais, hoje - timedelta(days=56), tolerancia=7)
+        uma    = _data_ate(df_anuais, referencia - timedelta(days=7),  tolerancia=7)
+        quatro = _data_ate(df_anuais, referencia - timedelta(days=28), tolerancia=7)
+        oito   = _data_ate(df_anuais, referencia - timedelta(days=56), tolerancia=7)
 
     return TresPublicacoes(hoje=hoje, uma_semana=uma, quatro_semanas=quatro, oito_semanas=oito)
 
@@ -90,36 +88,47 @@ def _calcular_streak(
     df: pd.DataFrame,
     indicador: str,
     ano_ref: int,
-    data_ref: date,
-    direcao: str,
+    v_hoje: float,
+    v_v1: float,
+    data_v1: date,
 ) -> int:
-    """Conta quantas publicações consecutivas (até data_ref) variaram na mesma direção."""
-    if direcao not in ("▲", "▼"):
+    """
+    Conta semanas consecutivas de variação na mesma direção que hoje→v1.
+    Regride 7 dias por vez a partir de data_v1. Inclui a semana atual (+1).
+    """
+    h, a = round(v_hoje, 2), round(v_v1, 2)
+    if h == a:
         return 0
+    direcao = "▲" if h > a else "▼"
+
     sub = df[(df["indicador"] == indicador) & (df["ano_ref"] == ano_ref)]
     if sub.empty:
-        return 0
-    datas = sorted([d for d in sub["data"].unique().tolist() if d <= data_ref], reverse=True)
-    if len(datas) < 2:
-        return 0
-    streak = 0
-    for i in range(len(datas) - 1):
-        v_novo = storage.valor_anual(df, indicador, ano_ref, datas[i])
-        v_ant = storage.valor_anual(df, indicador, ano_ref, datas[i + 1])
-        if v_novo is None or v_ant is None:
+        return 1
+
+    streak_prior = 0
+    d_atual = data_v1
+    v_atual = v_v1
+
+    for _ in range(52):
+        d_ant = storage.data_mais_proxima(sub, d_atual - timedelta(days=7), tolerancia_dias=7)
+        if d_ant is None or d_ant >= d_atual:
             break
-        h, a = round(v_novo, 2), round(v_ant, 2)
-        dir_atual = "▲" if h > a else ("▼" if h < a else "=")
-        if dir_atual == direcao:
-            streak += 1
-        else:
+        v_ant = storage.valor_anual(df, indicador, ano_ref, d_ant)
+        if v_ant is None:
             break
-    return streak
+        ra, rb = round(v_atual, 2), round(v_ant, 2)
+        dir_ = "▲" if ra > rb else ("▼" if ra < rb else "=")
+        if dir_ != direcao:
+            break
+        streak_prior += 1
+        d_atual = d_ant
+        v_atual = v_ant
+
+    return streak_prior + 1
 
 
 def montar_linhas(
     df_anuais: pd.DataFrame,
-    df_selic: pd.DataFrame,
     datas: TresPublicacoes,
     ano_ref: int,
 ) -> list[LinhaTabela]:
@@ -129,27 +138,10 @@ def montar_linhas(
             return None
         return storage.valor_anual(df_anuais, indicador, ano_ref, d)
 
-    def val_selic(d: Optional[date]) -> Optional[float]:
-        """Pega a Selic da última reunião registrada para o ano_ref naquela data."""
-        if d is None or df_selic.empty:
-            return None
-        sel = df_selic[
-            (df_selic["data"] == d)
-            & (df_selic["reuniao"].str.endswith(f"/{ano_ref}"))
-        ]
-        if sel.empty:
-            return None
-        sel = sel.copy()
-        sel["num"] = sel["reuniao"].str.extract(r"R(\d+)/").astype(int)
-        sel = sel.sort_values("num")
-        return float(sel["mediana"].iloc[-1])
-
-    def streak_para(indicador: str, hoje_val: Optional[float], v1_val: Optional[float], data_hoje: Optional[date]) -> int:
-        if hoje_val is None or v1_val is None or data_hoje is None:
+    def streak_para(indicador: str, hoje_val: Optional[float], v1_val: Optional[float], data_v1: Optional[date]) -> int:
+        if hoje_val is None or v1_val is None or data_v1 is None:
             return 0
-        h, a = round(hoje_val, 2), round(v1_val, 2)
-        direcao = "▲" if h > a else ("▼" if h < a else "=")
-        return _calcular_streak(df_anuais, indicador, ano_ref, data_hoje, direcao)
+        return _calcular_streak(df_anuais, indicador, ano_ref, hoje_val, v1_val, data_v1)
 
     ipca_hoje = val_anual("IPCA", datas.hoje)
     ipca_v1   = val_anual("IPCA", datas.uma_semana)
@@ -160,8 +152,8 @@ def montar_linhas(
     cam_hoje  = val_anual("Câmbio", datas.hoje)
     cam_v1    = val_anual("Câmbio", datas.uma_semana)
 
-    sel_hoje  = val_selic(datas.hoje)
-    sel_v1    = val_selic(datas.uma_semana)
+    sel_hoje  = val_anual("Selic", datas.hoje)
+    sel_v1    = val_anual("Selic", datas.uma_semana)
 
     return [
         LinhaTabela(
@@ -169,27 +161,27 @@ def montar_linhas(
             val_anual("IPCA", datas.oito_semanas),
             val_anual("IPCA", datas.quatro_semanas),
             ipca_v1, ipca_hoje,
-            streak_para("IPCA", ipca_hoje, ipca_v1, datas.hoje),
+            streak_para("IPCA", ipca_hoje, ipca_v1, datas.uma_semana),
         ),
         LinhaTabela(
             "PIB (variacao %)",
             val_anual("PIB Total", datas.oito_semanas),
             val_anual("PIB Total", datas.quatro_semanas),
             pib_v1, pib_hoje,
-            streak_para("PIB Total", pib_hoje, pib_v1, datas.hoje),
+            streak_para("PIB Total", pib_hoje, pib_v1, datas.uma_semana),
         ),
         LinhaTabela(
             "Cambio (USDBRL)",
             val_anual("Câmbio", datas.oito_semanas),
             val_anual("Câmbio", datas.quatro_semanas),
             cam_v1, cam_hoje,
-            streak_para("Câmbio", cam_hoje, cam_v1, datas.hoje),
+            streak_para("Câmbio", cam_hoje, cam_v1, datas.uma_semana),
         ),
         LinhaTabela(
             "Selic (% ao ano)",
-            val_selic(datas.oito_semanas),
-            val_selic(datas.quatro_semanas),
+            val_anual("Selic", datas.oito_semanas),
+            val_anual("Selic", datas.quatro_semanas),
             sel_v1, sel_hoje,
-            streak_para("Selic", sel_hoje, sel_v1, datas.hoje),
+            streak_para("Selic", sel_hoje, sel_v1, datas.uma_semana),
         ),
     ]

@@ -67,9 +67,7 @@ def main() -> int:
 
     # --- CARREGA BASE
     df_anuais = storage.load_anuais()
-    df_selic = storage.load_selic()
-    logger.info("Base local: %d linhas anuais | %d linhas selic",
-                len(df_anuais), len(df_selic))
+    logger.info("Base local: %d linhas anuais", len(df_anuais))
     if df_anuais.empty:
         logger.error("Base anual vazia. Rode com --force ou verifique a API.")
         return 1
@@ -80,7 +78,7 @@ def main() -> int:
                 datas.hoje, datas.uma_semana, datas.quatro_semanas, datas.oito_semanas)
 
     ano_tabela = (datas.hoje or datetime.today().date()).year
-    linhas = query.montar_linhas(df_anuais, df_selic, datas, ano_ref=ano_tabela)
+    linhas = query.montar_linhas(df_anuais, datas, ano_ref=ano_tabela)
 
     # Converte para o formato do render
     rows_data = []
